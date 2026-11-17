@@ -1,7 +1,7 @@
 """
 Enterprise Authentication Service.
 Handles JWT token generation, signature and claims verification,
-token_version revocation checks, and password hashing via bcrypt.
+token_version validation for immediate revocation, and password hashing via bcrypt.
 """
 
 from datetime import datetime, timezone, timedelta
@@ -27,6 +27,11 @@ class AuthenticationError(Exception):
 
 class InvalidTokenError(AuthenticationError):
     """Raised when JWT format or signature verification fails."""
+    pass
+
+
+class TokenRevokedError(AuthenticationError):
+    """Raised when token_version mismatch indicates token has been revoked."""
     pass
 
 
@@ -75,9 +80,9 @@ class AuthService:
         }
         return jwt.encode(payload, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
 
-    def verify_token(self, token: str) -> Dict[str, Any]:
+    def verify_token(self, token: str, validate_revocation: bool = True) -> Dict[str, Any]:
         """
-        Verify JWT token signature and expiration.
+        Verify JWT token validity and ensure it has not been revoked via token_version.
         """
         try:
             payload = jwt.decode(
@@ -91,4 +96,43 @@ class AuthService:
         except jwt.PyJWTError as e:
             raise InvalidTokenError(f"Failed to decode token: {str(e)}")
 
+        if validate_revocation:
+            user_id = payload.get("sub")
+            token_ver = payload.get("token_version")
+            self._check_token_version(user_id, token_ver)
+
         return payload
+
+    def _check_token_version(self, user_id: str, token_version: Optional[int]) -> None:
+        """
+        Validate token_version against current user record in database/cache.
+        Allows instant revocation of all active sessions upon logout or password reset.
+        """
+        if token_version is None:
+            raise TokenRevokedError("Missing token_version claim in token payload")
+
+        current_version = None
+        if self.cache:
+            current_version = self.cache.get(f"user:token_version:{user_id}")
+
+        if current_version is None and self.user_repo:
+            user = self.user_repo.find_by_id(user_id)
+            if user:
+                current_version = user.token_version
+
+        if current_version is not None and token_version < int(current_version):
+            logger.warning(
+                "Revoked session access attempt for user %s (token version: %d, current: %d)",
+                user_id, token_version, current_version
+            )
+            raise TokenRevokedError("Session has been revoked. Please sign in again.")
+
+    def revoke_all_sessions(self, user_id: str) -> int:
+        """Increment token_version to invalidate all existing tokens for this user immediately."""
+        new_version = 1
+        if self.user_repo:
+            new_version = self.user_repo.increment_token_version(user_id)
+        if self.cache:
+            self.cache.set(f"user:token_version:{user_id}", new_version)
+        logger.info("Revoked all sessions for user %s; new token_version=%d", user_id, new_version)
+        return new_version
